@@ -1,51 +1,40 @@
 (ns ring.middleware.http-basic-auth
   "Ring middleware for basic HTTP authentication."
-  (:use [remvee.base64 :as base64]))
+  (:import javax.xml.bind.DatatypeConverter)
+  (:require [clojure.string :as s]))
 
-(declare *user*)
+(defn base64decode [string]
+  (String. (DatatypeConverter/parseBase64Binary string)))
 
-(defn- get-credentials [req]
-  (let [auth ((req :headers) "authorization")
-        cred (and auth (base64/decode-str (last (re-find #"^Basic (.*)$" auth))))
-        username (and cred (last (re-find #"^(.*):" cred)))
-        password (and cred (last (re-find #":(.*)$" cred)))]
-    [username password]))
+(defn credentials [req]
+  (when-let [auth (get-in req [:headers "authorization"])]
+    (let [cred (base64decode (subs auth 5))]
+      (vec (s/split cred #":" 2)))))
 
-(defn wrap-with-auth
-  "Wrap response with a basic authentication challenge as described in
-  RFC2617 section 2.
+(defn assoc-in*
+  ([m ks v & kv]
+   (apply assoc-in (assoc-in m ks v) kv))
+  ([m [k & ks] v]
+   (if ks
+     (assoc m k (assoc-in (get m k) ks v))
+     (assoc m k v))))
 
-  The authenticate function is called with two parameters, the
-  username and password, and should return a value when the login is
-  valid."
+(defn challenge [resp realm]
+  (assoc-in* resp
+            [:status] 401
+            [:headers "WWW-Authenticate"]
+              (format "Basic realm=\"%s\"" realm)))
 
-  [app authenticate]
+(defn wrap-basic-auth
+  "RFC2617 Basic authenticator.
+  Supply realm string and credentials validation fn.
+  
+  (if-let [username (:login req)]
+    (str \"hi \" username)
+    \"error\")"
+  [handler realm user?]
   (fn [req]
-    (let [[username password] (get-credentials req)]
-      (binding [*user* (authenticate username password)]
-        (app req)))))
-
-(defn wrap-require-auth
-  "The realm is a descriptive string visible to the visitor.  It,
-  together with the canonical root URL, defines the protected resource
-  on the server.
-
-  The denied-response is a ring response structure which will be
-  returned when authorization fails.  The appropriate status and
-  authentication headers will be merged into it.  It defaults to plain
-  text 'access denied' response."
-
-  [app authenticate & [realm denied-response]]
-  (fn [req]
-    (let [[username password] (get-credentials req)]
-      (binding [*user* (authenticate username password)]
-        (if *user*
-          (app req)
-          (assoc
-            (merge {:headers {"Content-Type" "text/plain"}
-                    :body "HTTP authentication required."}
-              denied-response)
-            :status  401
-            :headers (merge (:headers denied-response)
-              {"WWW-Authenticate" (format
-                "Basic realm=\"%s\"" (or realm "Restricted Area"))})))))))
+    (let [[username password] (credentials req)]
+      (if-let [status (user? username password)]
+        (handler (assoc req :login status))
+        (challenge (handler req) realm)))))
